@@ -54,31 +54,35 @@ def event_object(event, event_source="s3"):
     records = event["Records"]
     if len(records) == 0:
         raise Exception("No records found in event!")
-    record = records[0]
 
-    s3_obj = record["s3"]
+    s3_objects = []
 
-    # Get the bucket name
-    if "bucket" not in s3_obj:
-        raise Exception("No bucket found in event!")
-    bucket_name = s3_obj["bucket"].get("name", None)
+    for record in records:
 
-    # Get the key name
-    if "object" not in s3_obj:
-        raise Exception("No key found in event!")
-    key_name = s3_obj["object"].get("key", None)
+        s3_obj = record["s3"]
 
-    if key_name:
-        key_name = unquote_plus(key_name)
+        # Get the bucket name
+        if "bucket" not in s3_obj:
+            raise Exception("No bucket found in event!")
+        bucket_name = s3_obj["bucket"].get("name", None)
 
-    # Ensure both bucket and key exist
-    if (not bucket_name) or (not key_name):
-        raise Exception("Unable to retrieve object from event.\n{}".format(event))
+        # Get the key name
+        if "object" not in s3_obj:
+            raise Exception("No key found in event!")
+        key_name = s3_obj["object"].get("key", None)
 
-    # Create and return the object
-    s3 = boto3.resource("s3")
-    return s3.Object(bucket_name, key_name)
+        if key_name:
+            key_name = unquote_plus(key_name)
 
+        # Ensure both bucket and key exist
+        if (not bucket_name) or (not key_name):
+            raise Exception("Unable to retrieve object from event.\n{}".format(event))
+
+        # Create and return the object
+        s3 = boto3.resource("s3")
+        s3_objects.append(s3.Object(bucket_name, key_name))
+
+    return s3_objects
 
 def verify_s3_object_version(s3, s3_object):
     # validate that we only process the original version of a file, if asked to do so
@@ -236,53 +240,57 @@ def lambda_handler(event, context):
 
     start_time = get_timestamp()
     print("Script starting at %s\n" % (start_time))
-    s3_object = event_object(event, event_source=EVENT_SOURCE)
+    
+    s3_objects = event_object(event, event_source=EVENT_SOURCE)
 
-    if str_to_bool(AV_PROCESS_ORIGINAL_VERSION_ONLY):
-        verify_s3_object_version(s3, s3_object)
+    for s3_object in s3_objects:
 
-    # Publish the start time of the scan
-    if AV_SCAN_START_SNS_ARN not in [None, ""]:
-        start_scan_time = get_timestamp()
-        sns_start_scan(sns_client, s3_object, AV_SCAN_START_SNS_ARN, start_scan_time)
+        if str_to_bool(AV_PROCESS_ORIGINAL_VERSION_ONLY):
+            verify_s3_object_version(s3, s3_object)
 
-    file_path = get_local_path(s3_object, "/tmp")
-    create_dir(os.path.dirname(file_path))
-    s3_object.download_file(file_path)
+        # Publish the start time of the scan
+        if AV_SCAN_START_SNS_ARN not in [None, ""]:
+            start_scan_time = get_timestamp()
+            sns_start_scan(sns_client, s3_object, AV_SCAN_START_SNS_ARN, start_scan_time)
 
-    scan_result, scan_signature = clamav.scan_file(file_path)
-    print(
-        "Scan of s3://%s resulted in %s\n"
-        % (os.path.join(s3_object.bucket_name, s3_object.key), scan_result)
-    )
+        file_path = get_local_path(s3_object, "/tmp")
+        create_dir(os.path.dirname(file_path))
+        s3_object.download_file(file_path)
 
-    result_time = get_timestamp()
-    # Set the properties on the object with the scan results
-    if "AV_UPDATE_METADATA" in os.environ:
-        set_av_metadata(s3_object, scan_result, scan_signature, result_time)
-    set_av_tags(s3_client, s3_object, scan_result, scan_signature, result_time)
-
-    # Publish the scan results
-    if AV_STATUS_SNS_ARN not in [None, ""]:
-        sns_scan_results(
-            sns_client,
-            s3_object,
-            AV_STATUS_SNS_ARN,
-            scan_result,
-            scan_signature,
-            result_time,
+        scan_result, scan_signature = clamav.scan_file(file_path)
+        print(
+            "Scan of s3://%s resulted in %s\n"
+            % (os.path.join(s3_object.bucket_name, s3_object.key), scan_result)
         )
 
-    metrics.send(
-        env=ENV, bucket=s3_object.bucket_name, key=s3_object.key, status=scan_result
-    )
-    # Delete downloaded file to free up room on re-usable lambda function container
-    try:
-        os.remove(file_path)
-    except OSError:
-        pass
-    if str_to_bool(AV_DELETE_INFECTED_FILES) and scan_result == AV_STATUS_INFECTED:
-        delete_s3_object(s3_object)
+        result_time = get_timestamp()
+        # Set the properties on the object with the scan results
+        if "AV_UPDATE_METADATA" in os.environ:
+            set_av_metadata(s3_object, scan_result, scan_signature, result_time)
+        set_av_tags(s3_client, s3_object, scan_result, scan_signature, result_time)
+
+        # Publish the scan results
+        if AV_STATUS_SNS_ARN not in [None, ""]:
+            sns_scan_results(
+                sns_client,
+                s3_object,
+                AV_STATUS_SNS_ARN,
+                scan_result,
+                scan_signature,
+                result_time,
+            )
+
+        metrics.send(
+            env=ENV, bucket=s3_object.bucket_name, key=s3_object.key, status=scan_result
+        )
+        # Delete downloaded file to free up room on re-usable lambda function container
+        try:
+            os.remove(file_path)
+        except OSError:
+            pass
+        if str_to_bool(AV_DELETE_INFECTED_FILES) and scan_result == AV_STATUS_INFECTED:
+            delete_s3_object(s3_object)
+
     stop_scan_time = get_timestamp()
     print("Script finished at %s\n" % stop_scan_time)
 
